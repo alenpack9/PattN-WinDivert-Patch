@@ -1,0 +1,206 @@
+name: Auto Sync, Patch, Build and Release
+
+on:
+  schedule:
+    # Run every 10 minutes
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new upstream commit is found'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  sync-and-build:
+    name: Check Upstream, Build & Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Patch Kit Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Upstream Patterniha/PattN for Updates
+        id: check_upstream
+        shell: pwsh
+        run: |
+          Write-Host "Checking upstream repository: https://github.com/patterniha/PattN (branch: my-releases)..."
+          $lsOutput = git ls-remote https://github.com/patterniha/PattN.git refs/heads/my-releases
+          if (-not $lsOutput) {
+              Write-Error "Failed to fetch remote refs from upstream patterniha/PattN."
+              exit 1
+          }
+          $upstreamSha = ($lsOutput -split "`t")[0].Trim()
+          Write-Host "Latest Upstream SHA: $upstreamSha"
+
+          $lastSha = ""
+          if (Test-Path "last_upstream_commit.txt") {
+              $lastSha = (Get-Content "last_upstream_commit.txt" -Raw).Trim()
+          }
+          Write-Host "Last Recorded SHA:   $lastSha"
+
+          $force = "${{ inputs.force_build }}" -eq "true"
+          if ($upstreamSha -eq $lastSha -and -not $force) {
+              Write-Host "Repository is already up to date with upstream. No build required." -ForegroundColor Green
+              echo "has_update=false" >> $env:GITHUB_OUTPUT
+          } else {
+              if ($force) {
+                  Write-Host "Force build requested by user." -ForegroundColor Yellow
+              } else {
+                  Write-Host "New upstream commit detected!" -ForegroundColor Yellow
+              }
+              echo "has_update=true" >> $env:GITHUB_OUTPUT
+              echo "upstream_sha=$upstreamSha" >> $env:GITHUB_OUTPUT
+              echo "UPSTREAM_SHA=$upstreamSha" >> $env:GITHUB_ENV
+          }
+
+      - name: Setup .NET 10 SDK
+        if: steps.check_upstream.outputs.has_update == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Clone Upstream PattN
+        if: steps.check_upstream.outputs.has_update == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Cloning patterniha/PattN (branch: my-releases)..."
+          git clone --recurse-submodules -b my-releases https://github.com/patterniha/PattN.git PattN-upstream
+
+      - name: Ensure Core Binaries
+        if: steps.check_upstream.outputs.has_update == 'true'
+        shell: pwsh
+        run: |
+          ./scripts/Ensure-Cores.ps1 -BinDir ./bin
+
+      - name: Run WinDivert Builder Batch
+        if: steps.check_upstream.outputs.has_update == 'true'
+        shell: cmd
+        run: |
+          call PattN-WinDivert-Build.bat "%CD%\PattN-upstream" --ci
+
+      - name: Push Patched Source Code to alenpack9/WinDivert
+        if: steps.check_upstream.outputs.has_update == 'true'
+        shell: pwsh
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_PAT)) {
+              Write-Warning "Secret GH_PAT is not defined in repository secrets. Skipping push to alenpack9/WinDivert."
+              Write-Warning "To push source to alenpack9/WinDivert, please add a Personal Access Token (repo scope) named GH_PAT."
+          } else {
+              Write-Host "Pushing patched source code to https://github.com/alenpack9/WinDivert..."
+              Push-Location PattN-upstream
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add -A
+              git diff-index --quiet HEAD || git commit -m "Sync upstream PattN ($env:UPSTREAM_SHA) with WinDivert & Connect/Disconnect patch"
+              git remote set-url origin "https://x-access-token:$($env:GH_PAT)@github.com/alenpack9/WinDivert.git"
+              git push origin HEAD:my-releases --force
+              git push origin HEAD:main --force
+              Pop-Location
+              Write-Host "Source code successfully updated on alenpack9/WinDivert!" -ForegroundColor Green
+          }
+
+      - name: Package Windows Release Archive
+        if: steps.check_upstream.outputs.has_update == 'true'
+        id: package
+        shell: pwsh
+        run: |
+          $releaseDir = "PattN-upstream/PattN-WinDivert-Release"
+          if (-not (Test-Path "$releaseDir/PattN.exe")) {
+              Write-Error "Build output PattN.exe not found in $releaseDir"
+              exit 1
+          }
+
+          $version = "latest"
+          $propsPath = "PattN-upstream/v2rayN/Directory.Build.props"
+          if (Test-Path $propsPath) {
+              $propsContent = Get-Content $propsPath -Raw
+              if ($propsContent -match '<Version>(.*?)</Version>') {
+                  $version = $Matches[1].Trim()
+              }
+          }
+
+          $shortSha = $env:UPSTREAM_SHA.Substring(0, 7)
+          $zipName = "PattN-WinDivert-Windows-x64.zip"
+          $zipPath = "$((Get-Item .).FullName)\$zipName"
+          Write-Host "Creating archive: $zipPath..."
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipPath -Force
+
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+          $hashFile = "$zipPath.sha256"
+          Set-Content -Path $hashFile -Value "$hash *$zipName"
+
+          $tag = "v$version-$shortSha"
+          echo "TAG=$tag" >> $env:GITHUB_ENV
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+          echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+          echo "SHA_PATH=$hashFile" >> $env:GITHUB_ENV
+          echo "SHORT_SHA=$shortSha" >> $env:GITHUB_ENV
+          Write-Host "Release package ready: $zipName with tag: $tag" -ForegroundColor Green
+
+      - name: Publish GitHub Release
+        if: steps.check_upstream.outputs.has_update == 'true'
+        shell: pwsh
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          $notes = @"
+          # PattN WinDivert Automated Release ($env:TAG)
+
+          Automated build with WinDivert Transparent Proxy and Connect/Disconnect features.
+
+          - **Upstream Version:** $env:VERSION
+          - **Upstream Commit:** https://github.com/patterniha/PattN/commit/$env:UPSTREAM_SHA
+          - **Architecture:** Windows x64 (Self-Contained Standalone)
+          - **SHA256:** $((Get-Content $env:SHA_PATH).Split(' ')[0])
+
+          ### Features Added:
+          1. **Connect / Disconnect Toggle Button** (Toolbar, StatusBar, Tray Icon Menu)
+          2. **WinDivert Transparent Proxy Mode** with driver injection
+          3. **Integrated Cores:** Aether, Xray, sing-box, mihomo, GeoIP & GeoSite rules
+          "@
+
+          if (-not [string]::IsNullOrWhiteSpace($env:GH_PAT)) {
+              Write-Host "Creating Release on alenpack9/WinDivert..."
+              $env:GH_TOKEN = $env:GH_PAT
+              gh release create "$env:TAG" "$env:ZIP_PATH" "$env:SHA_PATH" --repo alenpack9/WinDivert --title "PattN WinDivert $env:TAG" --notes "$notes"
+              Write-Host "Release created on alenpack9/WinDivert!" -ForegroundColor Green
+          }
+
+          # Also publish to PattN-WinDivert-Patch repo as backup
+          Write-Host "Creating Release on alenpack9/PattN-WinDivert-Patch..."
+          $env:GH_TOKEN = "${{ secrets.GITHUB_TOKEN }}"
+          gh release create "$env:TAG" "$env:ZIP_PATH" "$env:SHA_PATH" --title "PattN WinDivert $env:TAG" --notes "$notes"
+          Write-Host "Release created on alenpack9/PattN-WinDivert-Patch!" -ForegroundColor Green
+
+      - name: Upload Artifact
+        if: steps.check_upstream.outputs.has_update == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PattN-WinDivert-Windows-x64
+          path: ${{ env.ZIP_PATH }}
+
+      - name: Update Upstream Commit Record
+        if: steps.check_upstream.outputs.has_update == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Updating last_upstream_commit.txt to $env:UPSTREAM_SHA..."
+          Set-Content -Path "last_upstream_commit.txt" -Value $env:UPSTREAM_SHA -NoNewline
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_upstream_commit.txt
+          $diff = git status --porcelain
+          if ($diff) {
+              git commit -m "chore: record built upstream commit $env:UPSTREAM_SHA [skip ci]"
+              git push origin HEAD:main
+              Write-Host "State commit recorded successfully." -ForegroundColor Green
+          }

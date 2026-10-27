@@ -1,0 +1,25 @@
+# Compressed archives & backups
+*.rar
+*.7z
+*.zip
+
+# Visual Studio / IDE temporary files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build artifacts
+**/[Bb]in/[Dd]ebug/
+**/[Bb]in/[Rr]elease/
+**/[Oo]bj/
+
+# Cores and geo database directory (auto-managed / downloaded via Ensure-Cores.ps1)
+bin/
+
+# Test & run outputs
+PattN-WinDivert-Release/
+upstream-PattN/
+PattN/
+*.tmp
