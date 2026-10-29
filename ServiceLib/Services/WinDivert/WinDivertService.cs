@@ -54,7 +54,11 @@ public class WinDivertService
                 EnableDnsHijack = config.WinDivertItem.EnableDnsHijack,
                 DropQuic = config.WinDivertItem.DropQuic,
                 BypassLan = config.WinDivertItem.BypassLan,
-                DnsUrl = config.WinDivertItem.DnsUrl.IsNullOrEmpty() ? "https://cloudflare-dns.com/dns-query" : config.WinDivertItem.DnsUrl,
+                DnsUrl = config.WinDivertItem.DnsUrl.IsNullOrEmpty() || config.WinDivertItem.DnsUrl.Contains("cloudflare-dns.com")
+                    ? "https://1.1.1.1/dns-query"
+                    : config.WinDivertItem.DnsUrl,
+                BlockAaaa = true,
+                ResetStaleConnections = true,
                 ProxyPort = _proxyPort,
             };
 
@@ -62,6 +66,8 @@ public class WinDivertService
             _dnsResolver = new WinDivertDnsResolver(options.DnsUrl);
             _engine = new WinDivertEngine(_relay, _dnsResolver, options);
             _engine.Start();
+
+            LogCoreDnsWarning(config);
 
             LastError = null;
             return true;
@@ -126,5 +132,59 @@ public class WinDivertService
         {
             _relay.ProxyPort = port;
         }
+        _engine?.UpdateProxyPort(port);
+    }
+
+    /// <summary>
+    /// Warns when the core itself resolves names with plaintext DNS.
+    /// <para>
+    /// The core is excluded from the interception (it must reach its server directly), so a
+    /// plaintext DirectDNS/BootstrapDNS of the core bypasses the DNS hijack and leaves the
+    /// machine outside the tunnel. The setting itself is left untouched: the direct DNS is
+    /// what keeps local domains working.
+    /// </para>
+    /// </summary>
+    private static void LogCoreDnsWarning(Config config)
+    {
+        try
+        {
+            var dns = config.SimpleDNSItem;
+            if (dns == null)
+            {
+                return;
+            }
+
+            var plain = new List<string>();
+            if (IsPlaintextDns(dns.DirectDNS))
+            {
+                plain.Add($"DirectDNS={dns.DirectDNS}");
+            }
+            if (IsPlaintextDns(dns.BootstrapDNS))
+            {
+                plain.Add($"BootstrapDNS={dns.BootstrapDNS}");
+            }
+
+            if (plain.Count > 0)
+            {
+                Logging.SaveLog($"{_tag}: warning, the core resolves some names through plaintext DNS ({string.Join(", ", plain)}). The core is not intercepted, so these queries leave the machine outside the tunnel; use a DoH/DoT address when they must stay inside it.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog(_tag, ex);
+        }
+    }
+
+    private static bool IsPlaintextDns(string? value)
+    {
+        if (value.IsNullOrEmpty())
+        {
+            return false;
+        }
+
+        var v = value.Trim();
+        return !v.Contains("://")
+            && !v.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+            && !v.Equals("dhcp", StringComparison.OrdinalIgnoreCase);
     }
 }

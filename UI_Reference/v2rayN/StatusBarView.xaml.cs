@@ -55,6 +55,8 @@ public partial class StatusBarView
             this.OneWayBind(ViewModel, vm => vm.RunningInfoDisplay, v => v.txtRunningInfoDisplay.Text).DisposeWith(disposables);
             this.OneWayBind(ViewModel, vm => vm.SpeedProxyDisplay, v => v.txtSpeedProxyDisplay.Text).DisposeWith(disposables);
             this.OneWayBind(ViewModel, vm => vm.SpeedDirectDisplay, v => v.txtSpeedDirectDisplay.Text).DisposeWith(disposables);
+            this.OneWayBind(ViewModel, vm => vm.TrafficProxyDisplay, v => v.txtTrafficProxyDisplay.Text).DisposeWith(disposables);
+            this.OneWayBind(ViewModel, vm => vm.TrafficToolTipText, v => v.txtTrafficProxyDisplay.ToolTip).DisposeWith(disposables);
             this.Bind(ViewModel, vm => vm.EnableTun, v => v.togEnableTun.IsChecked).DisposeWith(disposables);
             this.Bind(ViewModel, vm => vm.EnableWinDivert, v => v.togEnableWinDivert.IsChecked).DisposeWith(disposables);
 

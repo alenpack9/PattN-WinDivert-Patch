@@ -13,6 +13,76 @@ public static class WinDivertProcessResolver
     [DllImport("iphlpapi.dll", SetLastError = true)]
     private static extern uint GetExtendedUdpTable(IntPtr pUdpTable, ref int pdwSize, bool bOrder, int ulAf, int tableClass, uint reserved = 0);
 
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint SetTcpEntry(IntPtr pTcprow);
+
+    private const uint MIB_TCP_STATE_DELETE_TCB = 12;
+
+    /// <summary>
+    /// The row used by SetTcpEntry to reset a connection.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MIB_TCPROW
+    {
+        public uint dwState;
+        public uint dwLocalAddr;
+        public uint dwLocalPort;
+        public uint dwRemoteAddr;
+        public uint dwRemotePort;
+    }
+
+    /// <summary>
+    /// Forcibly resets an established tcp connection of the machine.
+    /// <para>
+    /// A connection that was established before the interception started is not diverted by
+    /// the filter, so it keeps talking to the real destination and leaks the real ip. Resetting
+    /// it makes the application reconnect, and that new connection is diverted to the relay.
+    /// </para>
+    /// </summary>
+    /// <returns>True when the connection was reset.</returns>
+    public static bool ResetConnection(IPAddress localIp, ushort localPort, IPAddress remoteIp, ushort remotePort)
+    {
+        if (!Utils.IsWindows() || localIp.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork
+            || remoteIp.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            return false;
+        }
+
+        try
+        {
+            var row = new MIB_TCPROW
+            {
+                dwState = MIB_TCP_STATE_DELETE_TCB,
+                dwLocalAddr = BitConverter.ToUInt32(localIp.GetAddressBytes(), 0),
+                dwLocalPort = ToNetworkPort(localPort),
+                dwRemoteAddr = BitConverter.ToUInt32(remoteIp.GetAddressBytes(), 0),
+                dwRemotePort = ToNetworkPort(remotePort),
+            };
+
+            var ptr = Marshal.AllocHGlobal(Marshal.SizeOf<MIB_TCPROW>());
+            try
+            {
+                Marshal.StructureToPtr(row, ptr, false);
+                return SetTcpEntry(ptr) == 0;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(ptr);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("WinDivertProcessResolver", ex);
+            return false;
+        }
+    }
+
+    private static uint ToNetworkPort(ushort port)
+    {
+        // the port is stored in network byte order inside the low 16 bits
+        return (uint)(((port & 0xFF) << 8) | ((port >> 8) & 0xFF));
+    }
+
     private const int AF_INET = 2;
     private const int AF_INET6 = 23;
     private const int TCP_TABLE_OWNER_PID_ALL = 5;
@@ -65,6 +135,89 @@ public static class WinDivertProcessResolver
     private static readonly ConcurrentDictionary<int, (string? Name, string? Path, long ExpireTicks)> _pidCache = new();
 
     /// <summary>
+    /// An established tcp connection of the machine.
+    /// </summary>
+    /// <param name="LocalIp">Source address used by the application.</param>
+    /// <param name="LocalPort">Source port used by the application.</param>
+    /// <param name="RemoteIp">Destination address.</param>
+    /// <param name="RemotePort">Destination port.</param>
+    /// <param name="Pid">Process owning the connection.</param>
+    public record EstablishedConnection(IPAddress LocalIp, ushort LocalPort, IPAddress RemoteIp, ushort RemotePort, int Pid);
+
+    private const uint MIB_TCP_STATE_ESTAB = 5;
+
+    /// <summary>
+    /// Returns all established ipv4 tcp connections of the machine.
+    /// <para>
+    /// It is used at startup: only new connections (the SYN packet) are diverted, so a
+    /// connection that was already established before the interception started keeps talking
+    /// to the real destination and leaks the real ip address.
+    /// </para>
+    /// </summary>
+    public static List<EstablishedConnection> GetEstablishedTcpConnections()
+    {
+        var list = new List<EstablishedConnection>();
+        if (!Utils.IsWindows())
+        {
+            return list;
+        }
+
+        var bufferSize = 0;
+        GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (bufferSize <= 0)
+        {
+            return list;
+        }
+
+        var tablePtr = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            if (GetExtendedTcpTable(tablePtr, ref bufferSize, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != 0)
+            {
+                return list;
+            }
+
+            var rowCount = Marshal.ReadInt32(tablePtr);
+            var rowPtr = IntPtr.Add(tablePtr, 4);
+            var rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
+
+            for (var i = 0; i < rowCount; i++)
+            {
+                var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
+                rowPtr = IntPtr.Add(rowPtr, rowSize);
+
+                // dwLocalAddr / dwRemoteAddr are stored in network byte order
+                if (row.dwState != MIB_TCP_STATE_ESTAB || row.dwRemoteAddr == 0 || row.dwOwningPid == 0)
+                {
+                    continue;
+                }
+
+                var localIp = new IPAddress(row.dwLocalAddr);
+                var remoteIp = new IPAddress(row.dwRemoteAddr);
+                var localPort = (ushort)(((row.dwLocalPort & 0xFF) << 8) | ((row.dwLocalPort >> 8) & 0xFF));
+                var remotePort = (ushort)(((row.dwRemotePort & 0xFF) << 8) | ((row.dwRemotePort >> 8) & 0xFF));
+
+                if (localPort == 0 || remotePort == 0)
+                {
+                    continue;
+                }
+
+                list.Add(new EstablishedConnection(localIp, localPort, remoteIp, remotePort, (int)row.dwOwningPid));
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog("WinDivertProcessResolver", ex);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(tablePtr);
+        }
+
+        return list;
+    }
+
+    /// <summary>
     /// Known proxy cores / tunnels. Their traffic must never be diverted,
     /// otherwise the proxy would connect to itself.
     /// </summary>
@@ -72,8 +225,12 @@ public static class WinDivertProcessResolver
     {
         "xray", "p-xray-p", "v2ray", "wv2ray", "v2rayn", "pattn", "v2raya", "v2ray-core",
         "sing-box", "clash", "clash-meta", "clash-verge", "clash-verge-service", "mihomo",
-        "nekobox", "nekoray", "hiddify", "shadowsocks", "ss-local", "outline",
-        "trojan", "trojan-go", "naive", "naiveproxy", "warp-svc", "wireguard", "openvpn"
+        "nekobox", "nekoray", "hiddify", "hiddify-core", "shadowsocks", "ss-local", "outline",
+        "trojan", "trojan-go", "naive", "naiveproxy", "warp-svc", "wireguard", "openvpn",
+        // the tunnels shipped in the bin folder / used by the app: their traffic must reach
+        // their own servers directly and never be forwarded to the local proxy again
+        "aether", "aether-core", "lyrebird", "psiphon", "psiphon-tunnel-core",
+        "tun2socks", "lantern", "lanternsvc"
     };
 
     /// <summary>
@@ -146,7 +303,12 @@ public static class WinDivertProcessResolver
             || lower.Contains("clash")
             || lower.Contains("mihomo")
             || lower.Contains("nekobox")
-            || lower.Contains("hiddify");
+            || lower.Contains("hiddify")
+            || lower.Contains("aether")
+            || lower.Contains("lyrebird")
+            || lower.Contains("psiphon")
+            || lower.Contains("lantern")
+            || lower.Contains("tun2socks");
     }
 
     /// <summary>

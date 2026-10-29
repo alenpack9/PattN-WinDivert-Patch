@@ -8,7 +8,12 @@ namespace ServiceLib.Services.WinDivert;
 /// <param name="TargetIp">The real destination ip the application wanted to reach.</param>
 /// <param name="TargetPort">The real destination port.</param>
 /// <param name="LocalIp">The local ip used by the application (source address).</param>
-public record OriginalDestination(IPAddress TargetIp, ushort TargetPort, IPAddress LocalIp);
+/// <param name="Token">
+/// Unique id of this mapping. Windows reuses an ephemeral source port as soon as the previous
+/// connection is closed, so a delayed cleanup must never remove the entry of a newer
+/// connection that happens to use the same port.
+/// </param>
+public record OriginalDestination(IPAddress TargetIp, ushort TargetPort, IPAddress LocalIp, long Token = 0);
 
 /// <summary>
 /// Local relay used by the WinDivert engine.
@@ -45,6 +50,30 @@ public class WinDivertRelay : IDisposable
     public int ActiveConnections => _activeConnections;
 
     public long TotalBytesRelayed { get; private set; }
+
+    private long _tokenSeed;
+
+    /// <summary>
+    /// Creates a unique id for a new nat entry.
+    /// </summary>
+    public long NextToken() => Interlocked.Increment(ref _tokenSeed);
+
+    /// <summary>
+    /// Removes a nat entry, but only when it still belongs to the given connection.
+    /// <para>
+    /// Windows reuses an ephemeral source port immediately after the connection is closed.
+    /// Removing by port alone would delete the mapping of a newer connection that reused the
+    /// same port, and that connection would then leak outside of the tunnel (its packets fall
+    /// through to the direct path, so the real ip is exposed and the remote service refuses it).
+    /// </para>
+    /// </summary>
+    public void Release(ushort srcPort, long token)
+    {
+        if (NatTable.TryGetValue(srcPort, out var current) && current.Token == token)
+        {
+            NatTable.TryRemove(srcPort, out _);
+        }
+    }
 
     public void Start()
     {
@@ -87,6 +116,7 @@ public class WinDivertRelay : IDisposable
     {
         Interlocked.Increment(ref _activeConnections);
         ushort srcPort = 0;
+        long natToken = 0;
 
         try
         {
@@ -105,6 +135,7 @@ public class WinDivertRelay : IDisposable
                 {
                     return;
                 }
+                natToken = originalDest.Token;
 
                 using var proxyClient = new TcpClient();
                 proxyClient.NoDelay = true;
@@ -115,6 +146,11 @@ public class WinDivertRelay : IDisposable
                 try
                 {
                     await proxyClient.ConnectAsync(IPAddress.Loopback, ProxyPort, connectCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    // the engine is stopping, this is not an error
+                    return;
                 }
                 catch (Exception ex)
                 {
@@ -138,6 +174,10 @@ public class WinDivertRelay : IDisposable
                 await Task.WhenAll(upTask, downTask);
             }
         }
+        catch (OperationCanceledException)
+        {
+            // the engine is stopping, this is not an error
+        }
         catch (Exception ex)
         {
             Logging.SaveLog("WinDivertRelay", ex);
@@ -147,9 +187,13 @@ public class WinDivertRelay : IDisposable
             Interlocked.Decrement(ref _activeConnections);
 
             // Keep the mapping a little longer so the remaining fin/ack packets can be rewritten.
-            if (srcPort != 0)
+            // The removal is guarded by the token: a newer connection may have reused this port
+            // in the meantime, and its mapping must survive.
+            if (srcPort != 0 && natToken != 0)
             {
-                _ = Task.Delay(5000).ContinueWith(t => NatTable.TryRemove(srcPort, out _));
+                var token_ = natToken;
+                var port_ = srcPort;
+                _ = Task.Delay(5000).ContinueWith(t => Release(port_, token_));
             }
         }
     }

@@ -33,6 +33,12 @@
                         x:Name="txtSpeedDirectDisplay"
                         HorizontalAlignment="Right"
                         Style="{StaticResource StatusbarItem}" />
+                    <Border Margin="1" />
+                    <TextBlock
+                        x:Name="txtTrafficProxyDisplay"
+                        HorizontalAlignment="Right"
+                        ToolTipService.ShowDuration="60000"
+                        Style="{StaticResource StatusbarItem}" />
                 </StackPanel>
 
                 <StackPanel

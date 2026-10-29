@@ -100,6 +100,12 @@ public partial class StatusBarViewModel : MyReactiveObject
     public partial string SpeedDirectDisplay { get; set; }
 
     [Reactive]
+    public partial string TrafficProxyDisplay { get; set; }
+
+    [Reactive]
+    public partial string TrafficToolTipText { get; set; }
+
+    [Reactive]
     public partial bool EnableTun { get; set; }
 
     [Reactive]
@@ -138,6 +144,9 @@ public partial class StatusBarViewModel : MyReactiveObject
         {
             EnableWinDivert = true;
             BlWinDivert = true;
+            // The status bar shows upload/download speed and traffic in this mode, so the opt-in statistics service has to run.
+            _config.GuiItem.EnableStatistics = true;
+            _config.GuiItem.DisplayRealTimeSpeed = true;
         }
         else
         {
@@ -722,13 +731,15 @@ public partial class StatusBarViewModel : MyReactiveObject
 
     public async Task UpdateStatistics(ServerSpeedItem update)
     {
-        if (!_config.GuiItem.DisplayRealTimeSpeed || !IsConnected)
-        {
-            return;
-        }
-
         try
         {
+            UpdateTrafficDisplay(update);
+
+            if (!_config.GuiItem.DisplayRealTimeSpeed || !IsConnected)
+            {
+                return;
+            }
+
             if (AppManager.Instance.IsRunningCore(ECoreType.sing_box))
             {
                 SpeedProxyDisplay = string.Format(ResUI.SpeedDisplayText, EInboundProtocol.mixed, Utils.HumanFy(update.ProxyUp), Utils.HumanFy(update.ProxyDown));
@@ -744,6 +755,16 @@ public partial class StatusBarViewModel : MyReactiveObject
         {
         }
         await Task.CompletedTask;
+    }
+
+    private void UpdateTrafficDisplay(ServerSpeedItem update)
+    {
+        TrafficProxyDisplay = $"Σ ↑ {Utils.HumanFy(update.TotalUp)} | ↓ {Utils.HumanFy(update.TotalDown)}";
+        TrafficToolTipText = string.Join(Environment.NewLine,
+            $"{ResUI.LvTodayUploadDataAmount}: {Utils.HumanFy(update.TodayUp)}",
+            $"{ResUI.LvTodayDownloadDataAmount}: {Utils.HumanFy(update.TodayDown)}",
+            $"{ResUI.LvTotalUploadDataAmount}: {Utils.HumanFy(update.TotalUp)}",
+            $"{ResUI.LvTotalDownloadDataAmount}: {Utils.HumanFy(update.TotalDown)}");
     }
 
     #endregion UI
