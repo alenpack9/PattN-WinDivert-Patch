@@ -101,28 +101,28 @@ jobs:
         run: |
           call PattN-WinDivert-Build.bat "%CD%\PattN-upstream" --ci
 
-      - name: Push Patched Source Code to alenpack9/WinDivert
+      - name: Push Patched Source Code to WinDivert Repository
         if: steps.check_upstream.outputs.has_update == 'true'
         shell: pwsh
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:GH_PAT)) {
-              Write-Error "Secret GH_PAT is not defined, so the patched source cannot be pushed to alenpack9/WinDivert. Add a personal access token with write access to that repository as the GH_PAT secret (Settings -> Secrets and variables -> Actions)."
+              Write-Error "Secret GH_PAT is not defined, so the patched source cannot be pushed to ${{ github.repository_owner }}/WinDivert. Add a personal access token with write access to that repository as the GH_PAT secret (Settings -> Secrets and variables -> Actions)."
               exit 1
           }
 
-          Write-Host "Pushing patched source code to https://github.com/alenpack9/WinDivert..."
+          Write-Host "Pushing patched source code to https://github.com/${{ github.repository_owner }}/WinDivert..."
           Push-Location PattN-upstream
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff-index --quiet HEAD || git commit -m "Sync upstream PattN ($env:UPSTREAM_SHA) with WinDivert & Connect/Disconnect patch"
-          git remote set-url origin "https://x-access-token:$($env:GH_PAT)@github.com/alenpack9/WinDivert.git"
+          git remote set-url origin "https://x-access-token:$($env:GH_PAT)@github.com/${{ github.repository_owner }}/WinDivert.git"
           git push origin HEAD:my-releases --force
           git push origin HEAD:main --force
           Pop-Location
-          Write-Host "Source code successfully updated on alenpack9/WinDivert!" -ForegroundColor Green
+          Write-Host "Source code successfully updated on ${{ github.repository_owner }}/WinDivert!" -ForegroundColor Green
 
       - name: Package Windows Release Archive
         if: steps.check_upstream.outputs.has_update == 'true'
@@ -208,11 +208,11 @@ jobs:
           }
 
           $env:GH_TOKEN = $env:GH_PAT
-          Publish-Release "alenpack9/WinDivert"
+          Publish-Release "${{ github.repository_owner }}/WinDivert"
 
-          # Also publish to PattN-WinDivert-Patch repo as backup
+          # Also publish to this repository as backup
           $env:GH_TOKEN = "${{ secrets.GITHUB_TOKEN }}"
-          Publish-Release "alenpack9/PattN-WinDivert-Patch"
+          Publish-Release "${{ github.repository }}"
 
       - name: Upload Artifact
         if: steps.check_upstream.outputs.has_update == 'true'
